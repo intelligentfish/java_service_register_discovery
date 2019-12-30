@@ -15,6 +15,18 @@ import java.util.stream.Collectors;
  * 服务注册发现
  */
 public class ServiceRegisterDiscovery implements Watcher {
+    /**
+     * 服务改变接口
+     */
+    public interface ServiceChangeHandler {
+        /**
+         * 处理
+         *
+         * @param fullPath 全路径
+         */
+        void handle(List<String> fullPath);
+    }
+
     private static final Logger LOGGER = LoggerFactory.getLogger(ServiceRegisterDiscovery.class);// 日志
     private volatile boolean connectedFlag;// 连接标志
     private String zkAddress;// ZK地址
@@ -22,7 +34,7 @@ public class ServiceRegisterDiscovery implements Watcher {
     private ZooKeeper zk;// ZK客户端
     private CountDownLatch connectCountDownLatch;// 计数器
     private Map<String, Map<String, byte[]>> discoveryDataMap;// 发现数据
-    private Map<String, List<Function<List<String>, Void>>> discoveryCallback;// 发现回调
+    private Map<String, List<ServiceChangeHandler>> discoveryCallback;// 发现回调
 
     /**
      * 目录迭代
@@ -31,17 +43,15 @@ public class ServiceRegisterDiscovery implements Watcher {
      * @param callback 路径回调 /ip /ip/127.0.0.0:1001
      * @return 异常
      */
-    private Exception pathIterator(String path, Function<String, Exception> callback) {
-        Exception ex = null;
+    private Throwable pathIterator(String path, Function<String, Throwable> callback) {
         int end = path.indexOf("/", '/' == path.charAt(0) ? 1 : 0);
         for (; -1 != end; ) {
-            ex = callback.apply(path.substring(0, end));
+            Throwable ex = callback.apply(path.substring(0, end));
             if (null != ex) return ex;
             if ('/' == path.charAt(end)) end++;
             end = path.indexOf("/", end);
         }
-        ex = callback.apply(path);
-        return ex;
+        return callback.apply(path);
     }
 
     /**
@@ -65,15 +75,15 @@ public class ServiceRegisterDiscovery implements Watcher {
      */
     private void getChildrenAndWatch(String path) throws KeeperException, InterruptedException {
         // 获取最新的孩子列表
-        List<String> children = this.zk.getChildren(path, this);
+        List<String> children = this.zk.getChildren(path, true);
         // 孩子全路径集合
         Set<String> notifyChildrenFullPathSet = new HashSet<>();
         // 复制所有回调
-        List<Function<List<String>, Void>> changedCallbackList = new LinkedList<>();
+        List<ServiceChangeHandler> changedCallbackList = new LinkedList<>();
         synchronized (this.discoveryCallback) {
-            List<Function<List<String>, Void>> functions = this.discoveryCallback.get(path);
+            List<ServiceChangeHandler> functions = this.discoveryCallback.get(path);
             if (null != functions && !functions.isEmpty())
-                for (Function<List<String>, Void> function : functions) changedCallbackList.add(function);
+                for (ServiceChangeHandler handler : functions) changedCallbackList.add(handler);
         }
 
         do {
@@ -119,7 +129,7 @@ public class ServiceRegisterDiscovery implements Watcher {
                 if (null == stringMap) stringMap = new HashMap<>();
                 for (String child : children) {
                     String fullPath = String.format("%s/%s", path, child);
-                    byte[] data = this.zk.getData(fullPath, null, null);
+                    byte[] data = this.zk.getData(fullPath, true, null);
                     stringMap.put(fullPath, data);
                 }
 
@@ -129,8 +139,8 @@ public class ServiceRegisterDiscovery implements Watcher {
         } while (false);
 
         // 通知路径改变
-        for (Function<List<String>, Void> function : changedCallbackList) {
-            function.apply(notifyChildrenFullPathSet.stream().collect(Collectors.toList()));
+        for (ServiceChangeHandler handler : changedCallbackList) {
+            handler.handle(notifyChildrenFullPathSet.stream().collect(Collectors.toList()));
         }
     }
 
@@ -142,6 +152,7 @@ public class ServiceRegisterDiscovery implements Watcher {
     @Override
     public void process(WatchedEvent event) {
         LOGGER.info("zk event type: {}, state: {}", event.getType(), event.getState());
+
         // 处理首次连接
         if (event.getType() == Watcher.Event.EventType.None) {
             this.connectedFlag = event.getState() == Watcher.Event.KeeperState.SyncConnected;
@@ -235,7 +246,7 @@ public class ServiceRegisterDiscovery implements Watcher {
      */
     @SneakyThrows
     public ServiceRegisterDiscovery serviceRegister(String fullPath, byte[] data) {
-        Exception e = this.pathIterator(fullPath, current -> {
+        Throwable tx = this.pathIterator(fullPath, current -> {
             try {
                 if (null != this.zk.exists(current, false)) return null;
                 boolean equals = current.equals(fullPath);
@@ -243,31 +254,31 @@ public class ServiceRegisterDiscovery implements Watcher {
                         equals ? data : null,
                         ZooDefs.Ids.OPEN_ACL_UNSAFE,
                         equals ? CreateMode.EPHEMERAL : CreateMode.PERSISTENT);
-            } catch (Exception ex) {
-                return ex;
+            } catch (Throwable t) {
+                return t;
             }
             return null;
         });
-        if (null != e) throw e;
+        if (null != tx) throw tx;
         return this;
     }
 
     /**
      * 服务发现
      *
-     * @param topPath      顶级路径 eg. /ip
-     * @param onPathChange 改变回调
+     * @param topPath         顶级路径 eg. /ip
+     * @param onServiceChange 改变回调
      * @return
      */
     @SneakyThrows
     public ServiceRegisterDiscovery serviceDiscovery(String topPath,
-                                                     Function<List<String>, Void> onPathChange) {
+                                                     ServiceChangeHandler onServiceChange) {
         do {
             if (null == this.zk.exists(topPath, false)) break;
             synchronized (this.discoveryCallback) {
-                List<Function<List<String>, Void>> functions = this.discoveryCallback.get(topPath);
+                List<ServiceChangeHandler> functions = this.discoveryCallback.get(topPath);
                 if (null == functions) functions = new LinkedList<>();
-                functions.add(onPathChange);
+                functions.add(onServiceChange);
                 this.discoveryCallback.put(topPath, functions);
             }
             this.getChildrenAndWatch(topPath);
